@@ -1,0 +1,65 @@
+# === 민감 정보 (절대 커밋 금지) ===
+mcp.json
+.mcp.json
+.env
+.env.*
+*.env
+**/claude_desktop_config*.json
+!files_extracted/claude_desktop_config_groupware.json
+
+# Claude Code 로컬 설정 (권한 목록 등 로컬 환경 정보)
+.claude/
+CLAUDE.md
+
+# === 업무 문서 (고객·내부 정보 포함) ===
+*.docx
+*.xlsx
+*.pptx
+*.pdf
+*.hwp
+
+# === 로그 / 임시 ===
+*.log
+*.tmp
+temp/
+tmp/
+
+# === 스크린샷 (ERP 내부 화면 — 고객 정보 노출 가능) ===
+*.png
+*.jpg
+*.jpeg
+*.gif
+
+# === 디버그 / 실험 스크립트 ===
+_*.py
+_*.json
+_*.png
+
+# === 빌드 / 의존성 ===
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+node_modules/
+.pytest_cache/
+.mypy_cache/
+
+# === 압축본 / 재추출본 ===
+*.zip
+*.tar.gz
+*.7z
+files_extracted/
+
+# === IDE ===
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# === 테스트 산출물 ===
+tool-results/
+*.trace
+
+# === Windows ===
+desktop.ini

@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "erp_groupware": {
+      "type": "stdio",
+      "command": "C:\\Python314\\python.exe",
+      "args": ["C:\\mcp\\erp_groupware\\erp_groupware_mcp.py"],
+      "env": {
+        "ERP_BASE_URL": "https://erp.YOURCOMPANY.co.kr/#/login",
+        "ERP_USERNAME": "your_username",
+        "ERP_PASSWORD": "your_password"
+      }
+    }
+  }
+}

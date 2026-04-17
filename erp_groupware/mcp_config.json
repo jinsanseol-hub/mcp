@@ -1,0 +1,30 @@
+{
+  "_comment": "ERP 그룹웨어 MCP 서버 설정 파일",
+
+  "path_mappings": {
+    "_comment": [
+      "Claude Desktop 컨테이너는 자체 가상 파일시스템을 사용합니다.",
+      "컨테이너 내부의 /mnt/c/ 가 실제 Windows C: 드라이브와 공유되지 않으므로",
+      "경로 접두사 매핑은 사용하지 않습니다.",
+      "파일 첨부는 아래 temp_dir 폴더에 파일을 복사하거나",
+      "Windows 전체 경로(예: C:/Users/.../파일.xlsx)를 직접 지정하세요."
+    ]
+  },
+
+  "temp_dir": "C:\\mcp\\temp",
+
+  "_usage": [
+    "=== 첨부파일 전송 방법 ===",
+    "",
+    "방법 1 (권장): C:\\mcp\\temp\\ 폴더에 파일 복사 후 MCP 도구 호출",
+    "  - 탐색기에서 C:\\mcp\\temp 폴더에 파일 붙여넣기",
+    "  - attachments: ['C:/mcp/temp/파일명.xlsx']",
+    "",
+    "방법 2: Windows 전체 경로 직접 지정",
+    "  - attachments: ['C:/Users/jssul/Downloads/파일명.xlsx']",
+    "",
+    "방법 3: Claude Desktop에서 파일 첨부 후 파일명만 언급",
+    "  - Claude Desktop이 파일을 uploads 폴더에 저장하면 파일명으로 자동 검색됩니다",
+    "  - Claude Desktop 채팅에서 파일을 첨부(드래그앤드롭)하면 자동으로 파일을 찾습니다"
+  ]
+}
