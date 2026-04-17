@@ -594,6 +594,134 @@ class GroupwareClient:
             await self.page.reload(wait_until="domcontentloaded")
             await self.page.wait_for_selector(".fc-view, .fc-daygrid, .btn_sideRegi", timeout=8000)
 
+    async def _pick_date_from_popup(self, which_idx: int, target_ymd: str) -> bool:
+        """OBTDatePickerRebuild 팝업을 열어 target_ymd (YYYY-MM-DD) 날짜 셀을 클릭.
+
+        키보드 타이핑은 OBTDatePicker 내부 상태로 커밋되지 않으므로(OBTComplete2 버퍼에
+        갇힘) 사용자 수준 상호작용만이 유효. 경로:
+          1) 일시 scUnitBox 내 which_idx번째 ``img.OBTDatePickerRebuild_icon`` 좌표 클릭
+          2) ``.OBTFloatingPanel_root__2c4nn`` 등장 대기 → 헤더 ``<strong>YYYY.MM</strong>`` 읽기
+          3) 타겟 월과 차이만큼 ``이전달``/``다음달`` 버튼 클릭
+          4) 팝업 내 button 중 ``<span>text === target_day``이면서 현재 달에 속한 것 클릭
+        """
+        try:
+            target_y, target_m, target_d = target_ymd.split("-")
+            target_ym = f"{target_y}.{target_m}"
+            target_day = str(int(target_d))  # leading zero 제거 ("22")
+        except Exception as e:
+            logger.warning(f"[_pick_date] target_ymd 파싱 실패: {target_ymd} ({e})")
+            return False
+
+        # 1. 아이콘 좌표
+        icon = await self.page.evaluate(r"""(idx) => {
+            const panel = document.querySelector('.pubScLayer.active, .pubLayerSlide.active');
+            if (!panel) return null;
+            const box = [...panel.querySelectorAll('.scUnitBox')].find(b => {
+                const t = b.querySelector('.scUnitTop');
+                return t && (t.innerText || '').startsWith('일시');
+            });
+            if (!box) return null;
+            const icons = [...box.querySelectorAll('img[class*="OBTDatePickerRebuild_icon"]')];
+            if (!icons[idx]) return null;
+            const r = icons[idx].getBoundingClientRect();
+            if (r.width <= 0) return null;
+            return {x: Math.round(r.x + r.width/2), y: Math.round(r.y + r.height/2)};
+        }""", which_idx)
+        if not icon:
+            logger.warning(f"[_pick_date idx={which_idx}] 아이콘 좌표 획득 실패")
+            return False
+        await self.page.mouse.click(icon["x"], icon["y"])
+        await self.page.wait_for_timeout(700)
+
+        # 2. 팝업 등장 확인
+        popup_found = await self.page.evaluate(r"""() => {
+            for (const p of document.querySelectorAll('.OBTFloatingPanel_root__2c4nn')) {
+                if (p.closest('.fc-view')) continue;
+                const r = p.getBoundingClientRect();
+                if (r.width >= 200 && r.height >= 150 &&
+                    p.querySelector('.UFODateFieldDialog_calendar__3NKiy')) {
+                    return true;
+                }
+            }
+            return false;
+        }""")
+        if not popup_found:
+            logger.warning(f"[_pick_date idx={which_idx}] 팝업 미등장")
+            return False
+
+        # 3. 헤더 연월 확인 → 이동
+        for step in range(30):
+            header_ym = await self.page.evaluate(r"""() => {
+                for (const p of document.querySelectorAll('.OBTFloatingPanel_root__2c4nn')) {
+                    if (p.closest('.fc-view')) continue;
+                    const s = p.querySelector('strong');
+                    if (s) {
+                        const t = (s.innerText || '').trim();
+                        if (t.match(/^\d{4}\.\d{2}$/)) return t;
+                    }
+                }
+                return null;
+            }""")
+            if not header_ym:
+                logger.warning(f"[_pick_date] 팝업 헤더 연월 읽기 실패")
+                return False
+            if header_ym == target_ym:
+                break
+            # 비교: 타겟이 더 미래면 다음달, 과거면 이전달
+            direction = "다음달" if header_ym < target_ym else "이전달"
+            clicked = await self.page.evaluate(r"""(dir) => {
+                for (const p of document.querySelectorAll('.OBTFloatingPanel_root__2c4nn')) {
+                    if (p.closest('.fc-view')) continue;
+                    for (const b of p.querySelectorAll('button')) {
+                        const inner = [...b.querySelectorAll('span')].map(s => (s.innerText || '').trim());
+                        if (inner.includes(dir)) {
+                            const r = b.getBoundingClientRect();
+                            return {x: Math.round(r.x + r.width/2), y: Math.round(r.y + r.height/2)};
+                        }
+                    }
+                }
+                return null;
+            }""", direction)
+            if not clicked:
+                logger.warning(f"[_pick_date] {direction} 버튼 미발견")
+                return False
+            await self.page.mouse.click(clicked["x"], clicked["y"])
+            await self.page.wait_for_timeout(250)
+        else:
+            logger.warning(f"[_pick_date] 월 이동 30회 초과 — target={target_ym}, last={header_ym}")
+            return False
+
+        # 4. 타겟 일자 셀 클릭 (현재 달 한정: 색상이 회색(163,163,163)인 것은 인접 달 → 제외)
+        day_clicked = await self.page.evaluate(r"""(day) => {
+            for (const p of document.querySelectorAll('.OBTFloatingPanel_root__2c4nn')) {
+                if (p.closest('.fc-view')) continue;
+                // 달력 날짜 버튼만: 헤더 네비(이전년/이전달/다음달/다음년) 제외
+                const navWords = new Set(['이전년', '이전달', '다음달', '다음년']);
+                for (const b of p.querySelectorAll('button')) {
+                    const spans = [...b.querySelectorAll('span')].map(s => (s.innerText || '').trim());
+                    if (spans.some(t => navWords.has(t))) continue;
+                    // 숫자 일자 매칭
+                    const dayText = (b.innerText || '').trim();
+                    if (dayText !== day) continue;
+                    // 현재 달 여부: style.color가 'rgb(163, 163, 163)'(회색)이면 인접 달
+                    const col = (b.style && b.style.color) || '';
+                    if (col.includes('163, 163, 163')) continue;
+                    const r = b.getBoundingClientRect();
+                    b.click();  // JS click (좌표 클릭 병행 대비 즉시 커밋)
+                    return {x: Math.round(r.x + r.width/2), y: Math.round(r.y + r.height/2),
+                            color: col};
+                }
+            }
+            return null;
+        }""", target_day)
+        if not day_clicked:
+            logger.warning(f"[_pick_date] 일자 {target_day} 버튼 미발견 (month={target_ym})")
+            return False
+        # JS click + 좌표 mouse click 병행 (Vue 핸들러 대응)
+        await self.page.mouse.click(day_clicked["x"], day_clicked["y"])
+        await self.page.wait_for_timeout(400)
+        return True
+
     async def _select_time_from_dropdown(self, comp_id: str, target_time: str) -> bool:
         """OBTComplete2 시간 드롭다운에서 특정 시간 선택.
 
@@ -2135,26 +2263,25 @@ class GroupwareClient:
             await self.page.wait_for_timeout(300)
 
             # ── 일시 섹션 펼치기 ──
-            # '일시' 텍스트를 포함한 scUnitTop을 찾아 클릭 (여러 scUnitChild 중 정확한 것 선택)
+            # 토글 트리거: scUnitTop 오른쪽 끝의 .icoArr (.down → .up, scUnitChild display:none → flex).
+            # scUnitTop 본체 클릭은 이벤트 핸들러가 없어서 동작하지 않음 — .icoArr 좌표로 클릭해야 함.
             def _js_expand_date_section():
                 return """() => {
-                    // '일시' 라벨이 있는 scUnitTop 우선
-                    for (const el of document.querySelectorAll('.scUnitTop')) {
-                        if ((el.innerText || '').includes('일시')) { el.click(); return 'datetime'; }
+                    const panel = document.querySelector('.pubScLayer.active, .pubLayerSlide.active');
+                    if (!panel) return false;
+                    for (const top of panel.querySelectorAll('.scUnitTop')) {
+                        if (!(top.innerText || '').startsWith('일시')) continue;
+                        const box = top.closest('.scUnitBox');
+                        const child = box && box.querySelector('.scUnitChild');
+                        // 이미 펼쳐졌으면 스킵
+                        if (child && getComputedStyle(child).display !== 'none') return 'already';
+                        const arr = top.querySelector('.icoArr');
+                        if (arr) {
+                            const r = arr.getBoundingClientRect();
+                            return {trigger: 'icoArr', x: Math.round(r.x + r.width/2),
+                                    y: Math.round(r.y + r.height/2)};
+                        }
                     }
-                    // 없으면 날짜 input이 속한 scUnitBox의 scUnitTop 클릭
-                    const dateInput = document.querySelector(
-                        '.scUnitChild .OBTDatePickerRebuild_inputYMD__PtxMy, ' +
-                        '.scUnitChild input[placeholder*="날짜"]'
-                    );
-                    if (dateInput) {
-                        const box = dateInput.closest('.scUnitBox');
-                        const top = box && box.querySelector('.scUnitTop');
-                        if (top) { top.click(); return 'by_input'; }
-                    }
-                    // 최후: 2번째 scUnitBox
-                    const el2 = document.querySelector('.scUnitBox:nth-child(2) .scUnitTop');
-                    if (el2) { el2.click(); return 'nth2'; }
                     return false;
                 }"""
 
@@ -2171,16 +2298,19 @@ class GroupwareClient:
                 return false;
             }""")
             if not date_visible:
-                await self.page.evaluate(_js_expand_date_section())
-                await self.page.wait_for_timeout(800)
-                # visible 될 때까지 최대 3초 추가 대기
+                expand_info = await self.page.evaluate(_js_expand_date_section())
+                logger.info(f"[create] 일시 섹션 펼침 정보: {expand_info}")
+                if isinstance(expand_info, dict) and expand_info.get("trigger") == "icoArr":
+                    await self.page.mouse.click(expand_info["x"], expand_info["y"])
+                await self.page.wait_for_timeout(900)
                 try:
                     await date_loc_primary.first.wait_for(state="visible", timeout=2000)
                 except Exception:
-                    # 재시도
                     logger.warning("일시 섹션 펼치기 재시도...")
-                    await self.page.evaluate(_js_expand_date_section())
-                    await self.page.wait_for_timeout(600)
+                    retry = await self.page.evaluate(_js_expand_date_section())
+                    if isinstance(retry, dict) and retry.get("trigger") == "icoArr":
+                        await self.page.mouse.click(retry["x"], retry["y"])
+                    await self.page.wait_for_timeout(700)
 
             # ── 종일 여부 ──
             if event_data.get("all_day"):
@@ -2241,76 +2371,29 @@ class GroupwareClient:
                     'input[placeholder*="날짜"], input[placeholder*="시작"], .scUnitChild input[type="text"]'
                 )
 
-            async def _fill_date(loc, val: str):
-                """OBT 날짜 입력 — loc.focus() 직접 사용 (mouse.click 버블 회피).
-                scUnitTop이 click을 가로채 섹션 collapse + 포커스 이전 문제를 피하기 위해
-                Playwright의 locator.focus()로 포커스만 확실히 잡고 타이핑."""
-                try:
-                    await loc.focus(timeout=5000)
-                except Exception as e:
-                    logger.warning(f"_fill_date focus 실패: {e}")
-                    # 폴백: JS focus()
-                    await loc.evaluate("el => el.focus()")
-                await self.page.wait_for_timeout(300)
-                # 포커스 확인 디버그
-                focused = await self.page.evaluate("""() => {
-                    const a = document.activeElement;
-                    return a ? {tag: a.tagName, cls: (a.className || '').substring(0, 50), val: a.value || ''} : null;
-                }""")
-                logger.info(f"[_fill_date] focus 확인: {focused}")
-                await self.page.keyboard.press("Control+a")
-                await self.page.keyboard.press("Delete")
-                await self.page.keyboard.type(val, delay=50)
-                await self.page.wait_for_timeout(300)
-                await self.page.keyboard.press("ArrowDown")
-                await self.page.wait_for_timeout(100)
-                await self.page.keyboard.press("Enter")
-                await self.page.wait_for_timeout(400)
-
+            # 날짜 입력: OBTDatePickerRebuild는 키보드 타이핑이 내부 상태로 커밋되지 않음.
+            # 사용자 수준 상호작용만 유효하므로 캘린더 아이콘 → 팝업 → 날짜 셀 클릭으로 선택.
             if date_count >= 2:
-                await _fill_date(date_locators.nth(0), start_val)
-                await _fill_date(date_locators.nth(1), end_val)
-                # 실제 DOM 값 검증: OBTDatePickerRebuild는 "YYYY-MM-DD" 포맷 보관 (대시 포함)
+                ok_s = await self._pick_date_from_popup(0, start_date)
+                if not ok_s:
+                    logger.warning(f"[create] start_date={start_date} 팝업 선택 실패 — 재시도")
+                    await self.page.wait_for_timeout(500)
+                    ok_s = await self._pick_date_from_popup(0, start_date)
+                ok_e = await self._pick_date_from_popup(1, end_date)
+                if not ok_e:
+                    logger.warning(f"[create] end_date={end_date} 팝업 선택 실패 — 재시도")
+                    await self.page.wait_for_timeout(500)
+                    ok_e = await self._pick_date_from_popup(1, end_date)
+                # 값 확인 로그 (하드-페일 검증은 아래 form_state 블록에서 수행)
                 actual_dates = await self.page.evaluate("""() => {
                     const panel = document.querySelector('.pubScLayer.active, .pubLayerSlide.active');
                     if (!panel) return [];
                     const inputs = [...panel.querySelectorAll('.OBTDatePickerRebuild_inputYMD__PtxMy')];
                     return inputs.map(i => i.value);
                 }""")
-                logger.info(f"[create] 날짜 타이핑 후 값: {actual_dates}")
-                if len(actual_dates) >= 2 and (actual_dates[0] != start_date or actual_dates[1] != end_date):
-                    logger.warning(
-                        f"날짜 입력 불일치(기대={start_date}/{end_date}, 실제={actual_dates[:2]}) "
-                        f"— 재타이핑 재시도 (OBTDatePicker는 OBTComplete2 버퍼 → Enter 커밋 필요)"
-                    )
-                    # 재시도: 섹션 재전개 + 다시 mouse.click + type + Enter
-                    await self.page.evaluate(_js_expand_date_section())
-                    await self.page.wait_for_timeout(500)
-                    try:
-                        await _fill_date(date_locators.nth(0), start_val)
-                        await _fill_date(date_locators.nth(1), end_val)
-                    except Exception as e:
-                        logger.warning(f"재시도 _fill_date 실패: {e}")
+                logger.info(f"[create] 팝업 선택 후 DatePicker 값: {actual_dates}")
             else:
-                logger.warning(f"날짜 visible 필드 미발견 (count={date_count}) — JS native setter 사용")
-                await self.page.evaluate(f"""() => {{
-                    const inputs = [...document.querySelectorAll(
-                        '.scUnitChild .OBTDatePickerRebuild_inputYMD__PtxMy, ' +
-                        '.scUnitChild input[type="text"], .scUnitChild input:not([type])'
-                    )];
-                    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-                    if (inputs[0]) {{
-                        setter.call(inputs[0], '{start_val}');
-                        inputs[0].dispatchEvent(new Event('input', {{bubbles: true}}));
-                        inputs[0].dispatchEvent(new Event('change', {{bubbles: true}}));
-                    }}
-                    if (inputs[1]) {{
-                        setter.call(inputs[1], '{end_val}');
-                        inputs[1].dispatchEvent(new Event('input', {{bubbles: true}}));
-                        inputs[1].dispatchEvent(new Event('change', {{bubbles: true}}));
-                    }}
-                }}""")
-                await self.page.wait_for_timeout(500)
+                logger.warning(f"날짜 visible 필드 미발견 (count={date_count}) — 팝업 선택 시도 없이 진행")
 
             # ── 시간 입력 (OBTComplete2 드롭다운 클릭) ──
             time_warnings = []
