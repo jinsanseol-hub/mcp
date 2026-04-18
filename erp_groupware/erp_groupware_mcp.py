@@ -594,6 +594,134 @@ class GroupwareClient:
             await self.page.reload(wait_until="domcontentloaded")
             await self.page.wait_for_selector(".fc-view, .fc-daygrid, .btn_sideRegi", timeout=8000)
 
+    async def _pick_date_from_popup(self, which_idx: int, target_ymd: str) -> bool:
+        """OBTDatePickerRebuild 팝업을 열어 target_ymd (YYYY-MM-DD) 날짜 셀을 클릭.
+
+        키보드 타이핑은 OBTDatePicker 내부 상태로 커밋되지 않으므로(OBTComplete2 버퍼에
+        갇힘) 사용자 수준 상호작용만이 유효. 경로:
+          1) 일시 scUnitBox 내 which_idx번째 ``img.OBTDatePickerRebuild_icon`` 좌표 클릭
+          2) ``.OBTFloatingPanel_root__2c4nn`` 등장 대기 → 헤더 ``<strong>YYYY.MM</strong>`` 읽기
+          3) 타겟 월과 차이만큼 ``이전달``/``다음달`` 버튼 클릭
+          4) 팝업 내 button 중 ``<span>text === target_day``이면서 현재 달에 속한 것 클릭
+        """
+        try:
+            target_y, target_m, target_d = target_ymd.split("-")
+            target_ym = f"{target_y}.{target_m}"
+            target_day = str(int(target_d))  # leading zero 제거 ("22")
+        except Exception as e:
+            logger.warning(f"[_pick_date] target_ymd 파싱 실패: {target_ymd} ({e})")
+            return False
+
+        # 1. 아이콘 좌표
+        icon = await self.page.evaluate(r"""(idx) => {
+            const panel = document.querySelector('.pubScLayer.active, .pubLayerSlide.active');
+            if (!panel) return null;
+            const box = [...panel.querySelectorAll('.scUnitBox')].find(b => {
+                const t = b.querySelector('.scUnitTop');
+                return t && (t.innerText || '').startsWith('일시');
+            });
+            if (!box) return null;
+            const icons = [...box.querySelectorAll('img[class*="OBTDatePickerRebuild_icon"]')];
+            if (!icons[idx]) return null;
+            const r = icons[idx].getBoundingClientRect();
+            if (r.width <= 0) return null;
+            return {x: Math.round(r.x + r.width/2), y: Math.round(r.y + r.height/2)};
+        }""", which_idx)
+        if not icon:
+            logger.warning(f"[_pick_date idx={which_idx}] 아이콘 좌표 획득 실패")
+            return False
+        await self.page.mouse.click(icon["x"], icon["y"])
+        await self.page.wait_for_timeout(700)
+
+        # 2. 팝업 등장 확인
+        popup_found = await self.page.evaluate(r"""() => {
+            for (const p of document.querySelectorAll('.OBTFloatingPanel_root__2c4nn')) {
+                if (p.closest('.fc-view')) continue;
+                const r = p.getBoundingClientRect();
+                if (r.width >= 200 && r.height >= 150 &&
+                    p.querySelector('.UFODateFieldDialog_calendar__3NKiy')) {
+                    return true;
+                }
+            }
+            return false;
+        }""")
+        if not popup_found:
+            logger.warning(f"[_pick_date idx={which_idx}] 팝업 미등장")
+            return False
+
+        # 3. 헤더 연월 확인 → 이동
+        for step in range(30):
+            header_ym = await self.page.evaluate(r"""() => {
+                for (const p of document.querySelectorAll('.OBTFloatingPanel_root__2c4nn')) {
+                    if (p.closest('.fc-view')) continue;
+                    const s = p.querySelector('strong');
+                    if (s) {
+                        const t = (s.innerText || '').trim();
+                        if (t.match(/^\d{4}\.\d{2}$/)) return t;
+                    }
+                }
+                return null;
+            }""")
+            if not header_ym:
+                logger.warning(f"[_pick_date] 팝업 헤더 연월 읽기 실패")
+                return False
+            if header_ym == target_ym:
+                break
+            # 비교: 타겟이 더 미래면 다음달, 과거면 이전달
+            direction = "다음달" if header_ym < target_ym else "이전달"
+            clicked = await self.page.evaluate(r"""(dir) => {
+                for (const p of document.querySelectorAll('.OBTFloatingPanel_root__2c4nn')) {
+                    if (p.closest('.fc-view')) continue;
+                    for (const b of p.querySelectorAll('button')) {
+                        const inner = [...b.querySelectorAll('span')].map(s => (s.innerText || '').trim());
+                        if (inner.includes(dir)) {
+                            const r = b.getBoundingClientRect();
+                            return {x: Math.round(r.x + r.width/2), y: Math.round(r.y + r.height/2)};
+                        }
+                    }
+                }
+                return null;
+            }""", direction)
+            if not clicked:
+                logger.warning(f"[_pick_date] {direction} 버튼 미발견")
+                return False
+            await self.page.mouse.click(clicked["x"], clicked["y"])
+            await self.page.wait_for_timeout(250)
+        else:
+            logger.warning(f"[_pick_date] 월 이동 30회 초과 — target={target_ym}, last={header_ym}")
+            return False
+
+        # 4. 타겟 일자 셀 클릭 (현재 달 한정: 색상이 회색(163,163,163)인 것은 인접 달 → 제외)
+        day_clicked = await self.page.evaluate(r"""(day) => {
+            for (const p of document.querySelectorAll('.OBTFloatingPanel_root__2c4nn')) {
+                if (p.closest('.fc-view')) continue;
+                // 달력 날짜 버튼만: 헤더 네비(이전년/이전달/다음달/다음년) 제외
+                const navWords = new Set(['이전년', '이전달', '다음달', '다음년']);
+                for (const b of p.querySelectorAll('button')) {
+                    const spans = [...b.querySelectorAll('span')].map(s => (s.innerText || '').trim());
+                    if (spans.some(t => navWords.has(t))) continue;
+                    // 숫자 일자 매칭
+                    const dayText = (b.innerText || '').trim();
+                    if (dayText !== day) continue;
+                    // 현재 달 여부: style.color가 'rgb(163, 163, 163)'(회색)이면 인접 달
+                    const col = (b.style && b.style.color) || '';
+                    if (col.includes('163, 163, 163')) continue;
+                    const r = b.getBoundingClientRect();
+                    b.click();  // JS click (좌표 클릭 병행 대비 즉시 커밋)
+                    return {x: Math.round(r.x + r.width/2), y: Math.round(r.y + r.height/2),
+                            color: col};
+                }
+            }
+            return null;
+        }""", target_day)
+        if not day_clicked:
+            logger.warning(f"[_pick_date] 일자 {target_day} 버튼 미발견 (month={target_ym})")
+            return False
+        # JS click + 좌표 mouse click 병행 (Vue 핸들러 대응)
+        await self.page.mouse.click(day_clicked["x"], day_clicked["y"])
+        await self.page.wait_for_timeout(400)
+        return True
+
     async def _select_time_from_dropdown(self, comp_id: str, target_time: str) -> bool:
         """OBTComplete2 시간 드롭다운에서 특정 시간 선택.
 
@@ -922,17 +1050,49 @@ class GroupwareClient:
             if idx >= len(rows):
                 return {"success": False, "error": f"메일 인덱스 {idx} 없음 (목록 총 {len(rows)}개)"}
 
-            # 로딩 오버레이 제거 후 JS 클릭 (listItem은 DOM에 있지만 Playwright visibility 기준 미충족)
+            # 로딩 오버레이 제거
             await self.page.evaluate("""() => {
                 document.querySelectorAll('.OBTLoading_wrapper__1NIDH, [class*="Loading"]')
                     .forEach(el => { el.style.display = 'none'; el.style.pointerEvents = 'none'; });
             }""")
-            await self.page.evaluate(
-                "(el) => { el.scrollIntoView({block:'center'}); el.click(); }", rows[idx]
-            )
+            # 대상 행의 좌표 얻기 + 실제 마우스 클릭 (Vue 행 click 핸들러 발화)
+            # el.click()은 Vue가 무시. mouse.click(좌표)로 실제 이벤트 트리거.
+            click_info = await self.page.evaluate(f"""(idx) => {{
+                const rows = document.querySelectorAll('.listItem');
+                if (idx >= rows.length) return null;
+                const row = rows[idx];
+                row.scrollIntoView({{block: 'center'}});
+                // 행 내부의 제목 링크 우선 탐색 (있으면 그 좌표, 없으면 행 중앙)
+                const titleLink = row.querySelector('a.subject, .subject a, a[class*="title"], a[class*="subject"]');
+                const target = titleLink || row;
+                const r = target.getBoundingClientRect();
+                return {{
+                    x: Math.round(r.left + r.width / 2),
+                    y: Math.round(r.top + r.height / 2),
+                    usedTitleLink: !!titleLink,
+                }};
+            }}""", idx)
+            if not click_info:
+                return {"success": False, "error": f"메일 행 좌표 획득 실패 (index={idx})"}
+            await self.page.mouse.click(click_info["x"], click_info["y"])
 
-            # 메일 상세 패널 로딩 대기
-            await self.page.wait_for_timeout(2000)
+            # 메일 상세 패널 로딩 대기 — 더블클릭 폴백 포함
+            await self.page.wait_for_timeout(1500)
+            # 상세 뷰가 열렸는지 확인: '보낸사람' 텍스트 존재 여부
+            detail_opened = await self.page.evaluate("""() => {
+                for (const el of document.querySelectorAll('div, td, span, label')) {
+                    const t = (el.innerText || '').trim();
+                    if (t === '보낸사람') {
+                        const r = el.getBoundingClientRect();
+                        if (r.width > 0 && r.height > 0) return true;
+                    }
+                }
+                return false;
+            }""")
+            if not detail_opened:
+                # 더블클릭 시도
+                await self.page.mouse.dblclick(click_info["x"], click_info["y"])
+                await self.page.wait_for_timeout(1500)
 
             # ── 본문 iframe 탐색 (읽기 뷰 iframe: 더존 아마란스는 읽기용 iframe 별도 사용) ──
             body = ""
@@ -956,93 +1116,151 @@ class GroupwareClient:
 
             # ── 헤더(발신/수신/제목/날짜) + 첨부파일: JS innerText 파싱 ──
             detail_js = await self.page.evaluate("""() => {
-                // 메일 상세 패널: 우측(x>700) 또는 페이지 전체에서 메일 뷰 찾기
-                const candidates = [
-                    ...document.querySelectorAll(
-                        '.viewHead, .mailView, [class*="viewHead"], [class*="mailView"], ' +
-                        '[class*="mailRead"], [class*="readMail"], [class*="mailDetail"], ' +
-                        '.UDA0050, .UDA0060, [class*="UDA00"]'
-                    )
-                ].filter(el => {
+                // 메일 상세 패널 찾기 — "보낸사람" / "받는사람" 라벨을 포함하는 최소 크기 컨테이너
+                // 이 라벨은 메일 상세뷰에만 존재, 사이드바/메뉴에는 없음
+                let candidates = [];
+                for (const el of document.querySelectorAll('div, section, article, table')) {
                     const r = el.getBoundingClientRect();
-                    return r.width > 100 && r.height > 50;
-                });
+                    if (r.width < 300 || r.height < 100) continue;
+                    const txt = (el.innerText || '');
+                    if (txt.length < 50 || txt.length > 30000) continue;
+                    // 메일 상세뷰 특징: '보낸사람' 라벨 존재 + 사이드바 메뉴(일정/자원/게시판) 미포함
+                    const hasSenderLabel = txt.includes('보낸사람') || txt.includes('받는사람');
+                    const isSidebar = txt.startsWith('임직원업무관리') || txt.startsWith('일정\\n자원') ||
+                                      (txt.includes('전자결재') && txt.includes('업무관리') && txt.length < 2000);
+                    if (hasSenderLabel && !isSidebar) {
+                        candidates.push({el, sel: 'label_match', rect: r,
+                            cls: (el.className || '').substring(0, 60)});
+                    }
+                }
+                // 본문 panel: 가장 풍부한 컨텐츠(longest innerText)
+                candidates.sort((a, b) => (b.el.innerText || '').length - (a.el.innerText || '').length);
+                const bodyPanel = (candidates[0] && candidates[0].el) || null;
+                // 헤더 panel: '보낸사람' + '받는사람' + '제목' 라벨을 모두 포함한 가장 작은 컨테이너
+                // (큰 panel은 본문 전체 포함해서 라벨 parsing 부정확 → 전용 header panel 분리)
+                let headerPanel = null;
+                let headerCandidates = [];
+                for (const c of candidates) {
+                    const t = c.el.innerText || '';
+                    if (t.includes('보낸사람') && t.includes('제목') && t.length < 5000) {
+                        headerCandidates.push(c);
+                    }
+                }
+                headerCandidates.sort((a, b) => (a.el.innerText||'').length - (b.el.innerText||'').length);
+                headerPanel = headerCandidates[0] ? headerCandidates[0].el : bodyPanel;
 
-                // 가장 크고 오른쪽에 있는 패널 선택
-                candidates.sort((a, b) => {
-                    const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
-                    return (rb.width * rb.height) - (ra.width * ra.height);
-                });
+                const panel = bodyPanel;
+                const panelSel = candidates[0] ? candidates[0].sel : 'not_found';
+                const panelText = panel ? (panel.innerText || '').substring(0, 5000) : '';
+                const headerText = headerPanel ? (headerPanel.innerText || '').substring(0, 2000) : '';
 
-                const panel = candidates[0] || document.body;
-                const panelText = (panel.innerText || '').substring(0, 2000);
-
-                // 간단 라벨 파싱 (보낸사람/받는사람/제목/날짜)
+                // 헤더 파싱 — 라벨 element의 next sibling / 부모 row 찾기
                 let sender = '', to_addr = '', subject = '', date = '';
-
-                // 방법 A: 특정 셀렉터 시도
-                const selMap = {
-                    sender: ['.item-from .addr', '.from .addr', '.from', '[class*="sender"]', '[class*="from"]'],
-                    to:     ['.item-to .addr', '.to .addr', '.to', '[class*="receiver"]'],
-                    subject:['.item-subject .title', '.subject', '[class*="subject"]', '[class*="title"]'],
-                    date:   ['.item-date', '.date', '[class*="date"]', '[class*="time"]'],
-                };
-                for (const [field, sels] of Object.entries(selMap)) {
-                    for (const sel of sels) {
-                        const el = panel.querySelector(sel);
-                        if (el) {
-                            const t = (el.innerText || el.textContent || '').trim();
-                            if (t) {
-                                if (field === 'sender') sender = t;
-                                else if (field === 'to') to_addr = t;
-                                else if (field === 'subject') subject = t;
-                                else if (field === 'date') date = t;
-                                break;
+                // 방법 1: 테이블/dl/레이블 기반 — "보낸사람" 라벨 요소의 sibling에서 값 추출
+                function findHeaderValue(labelText) {
+                    // 모든 가능한 라벨 요소 탐색
+                    for (const el of document.querySelectorAll('th, td, dt, label, span, div')) {
+                        const t = (el.innerText || '').trim();
+                        if (t !== labelText) continue;
+                        const r = el.getBoundingClientRect();
+                        if (r.width === 0) continue;
+                        // 옵션 A: next sibling
+                        if (el.nextElementSibling) {
+                            const v = (el.nextElementSibling.innerText || '').trim();
+                            if (v && v !== labelText && v.length < 500) return v;
+                        }
+                        // 옵션 B: 부모의 next row (<tr>의 경우 같은 row의 다음 td)
+                        const parent = el.parentElement;
+                        if (parent && parent.tagName === 'TR') {
+                            const tds = [...parent.querySelectorAll('td, th')];
+                            const idx = tds.indexOf(el);
+                            if (idx >= 0 && tds[idx + 1]) {
+                                const v = (tds[idx + 1].innerText || '').trim();
+                                if (v && v !== labelText && v.length < 500) return v;
                             }
                         }
                     }
+                    return '';
+                }
+                // 라벨 변형 시도 — 앞뒤 공백/콜론 허용
+                function tryLabels(variants) {
+                    for (const v of variants) {
+                        const r = findHeaderValue(v);
+                        if (r) return r;
+                    }
+                    return '';
+                }
+                sender = tryLabels(['보낸사람', '보낸 사람', 'From', '발신자']);
+                to_addr = tryLabels(['받는사람', '받는 사람', 'To', '수신자']);
+                subject = tryLabels(['제목', 'Subject', '메일제목']);
+                date = tryLabels(['보낸날짜', '보낸 날짜', '날짜', 'Date', '보낸시간']);
+                // 라벨 prefix 제거 (셀렉터 매칭이 라벨까지 포함한 경우)
+                if (sender.startsWith('보낸사람')) sender = sender.replace(/^보낸사람\\s*\\n?/, '').trim();
+                if (to_addr.startsWith('받는사람')) to_addr = to_addr.replace(/^받는사람\\s*\\n?/, '').trim();
+                if (subject.startsWith('제목')) subject = subject.replace(/^제목\\s*\\n?/, '').trim();
+                if (date.startsWith('날짜') || date.startsWith('보낸날짜')) {
+                    date = date.replace(/^(보낸날짜|날짜)\\s*\\n?/, '').trim();
                 }
 
                 // 첨부파일
                 const attachments = [];
-                for (const el of panel.querySelectorAll(
-                    '.attachList .attachItem, .fileList .fileItem, [class*="attach"] a, [class*="file"] a'
+                const scope = panel || document;
+                for (const el of scope.querySelectorAll(
+                    '.attachList .attachItem, .fileList .fileItem, [class*="attach"] a, [class*="file"] a, ' +
+                    '[class*="Attach"] a, [class*="Attachment"]'
                 )) {
-                    const t = (el.innerText || el.textContent || '').trim();
-                    if (t && !attachments.find(a => a.filename === t)) {
+                    const t = (el.innerText || '').trim();
+                    if (t && t.length < 200 && !attachments.find(a => a.filename === t)) {
                         attachments.push({filename: t});
                     }
                 }
 
-                // frame 이름 목록 (디버그용)
-                const frames = [...document.querySelectorAll('iframe')].map(f =>
-                    (f.name || f.id || f.src || '').substring(0, 60)
-                );
+                // iframe 목록 (디버그)
+                const frames = [...document.querySelectorAll('iframe')].map(f => ({
+                    name: f.name || '',
+                    id: f.id || '',
+                    src: (f.src || '').substring(0, 80),
+                    visible: f.getBoundingClientRect().width > 0,
+                }));
 
-                return {sender, to_addr, subject, date, attachments, panelText, frames};
+                return {sender, to_addr, subject, date, attachments, panelText, panelSel, frames,
+                        candidatesCount: candidates.length};
             }""")
 
-            # iframe body 미확보 시 패널 내 텍스트에서 body 추출
+            # iframe body 미확보 시 패널 내 텍스트에서 body 추출 (헤더 라벨 이후 구간)
             if not body and detail_js.get("panelText"):
-                # 헤더 다음 텍스트를 body로 간주 (간이 파싱)
-                panel_lines = detail_js["panelText"].split("\n")
-                body_lines = [l.strip() for l in panel_lines if l.strip()
-                              and l.strip() not in (detail_js.get("subject",""), detail_js.get("date",""),
-                                                     detail_js.get("sender",""), detail_js.get("to_addr",""))]
-                body = "\n".join(body_lines[3:]) if len(body_lines) > 3 else ""
+                panel_text = detail_js["panelText"]
+                # 패널 미발견(candidatesCount=0)이면 사이드바 text이므로 body로 쓰지 않음
+                if detail_js.get("candidatesCount", 0) > 0:
+                    # 헤더 라벨들 이후의 본문 시작점 찾기
+                    header_labels = ["보낸사람", "받는사람", "제목", "보낸날짜", "날짜", "첨부파일"]
+                    lines = panel_text.split("\n")
+                    # 마지막 헤더 라벨 이후 시작
+                    last_header_idx = -1
+                    for i, line in enumerate(lines):
+                        if line.strip() in header_labels:
+                            last_header_idx = i
+                    if last_header_idx >= 0:
+                        # 헤더 라벨 + 그 다음 값(1줄) 건너뛰고 시작
+                        body_lines = lines[last_header_idx + 2:]
+                        body = "\n".join(l for l in body_lines if l.strip()).strip()
+                    else:
+                        body = panel_text
 
-            # iframe에서 본문을 읽지 못했으면 실제 읽기 iframe 재시도
+            # visible iframe에서 본문 재탐색
             if not body:
                 for frame in self.page.frames:
-                    if frame.name and frame != self.page.main_frame:
-                        try:
-                            body_el = await frame.query_selector("body")
-                            candidate = (await body_el.text_content()).strip() if body_el else ""
-                            if len(candidate) > 20:
-                                body = candidate
-                                break
-                        except Exception:
-                            continue
+                    if frame == self.page.main_frame:
+                        continue
+                    try:
+                        body_el = await frame.query_selector("body")
+                        candidate = (await body_el.text_content()).strip() if body_el else ""
+                        # 너무 짧거나 사이드바 chrome 텍스트 제외
+                        if len(candidate) > 20 and "임직원업무관리" not in candidate[:50]:
+                            body = candidate
+                            break
+                    except Exception:
+                        continue
 
             detail = {
                 "mail_id": mail_id,
@@ -1052,8 +1270,12 @@ class GroupwareClient:
                 "date": detail_js.get("date", ""),
                 "body": body,
                 "attachments": detail_js.get("attachments", []),
-                "_debug_frames": detail_js.get("frames", []),
-                "_debug_panel_preview": detail_js.get("panelText", "")[:300],
+                "_debug": {
+                    "panel_sel": detail_js.get("panelSel", ""),
+                    "candidates_count": detail_js.get("candidatesCount", 0),
+                    "frames": detail_js.get("frames", []),
+                    "panel_preview": detail_js.get("panelText", "")[:300],
+                },
             }
             return {"success": True, "mail": detail}
         except Exception as e:
@@ -1334,52 +1556,123 @@ class GroupwareClient:
             return {"success": False, "error": str(e)}
 
     async def search_mail(self, keyword: str, folder: str = "inbox", page_num: int = 1) -> dict:
-        """메일 검색 (더존 아마란스 검색 UI 사용)"""
+        """메일 검색 (더존 아마란스 검색 UI 사용).
+        Vue 컴포넌트는 합성 KeyboardEvent(dispatchEvent)를 인식하지 않으므로
+        Playwright의 실제 keyboard 이벤트 + 돋보기 버튼 클릭 폴백 사용."""
         if not await self.ensure_logged_in():
             return {"success": False, "error": "로그인 실패"}
         try:
             await self._navigate_to_mail()
 
-            # 검색창 찾기 (여러 후보 셀렉터 시도)
-            search_input = None
-            for sel in [
-                'input[placeholder*="검색"]',
-                'input[placeholder*="Search"]',
-                '.searchBox input',
-                '.OBTSearcher input',
-                '.search-input input',
-                'input[type="search"]',
-            ]:
-                el = await self.page.query_selector(sel)
-                if el:
-                    search_input = el
-                    break
+            # 메일 리스트 근처의 검색 input만 선택 (상단 통합검색창 제외)
+            # 전략: .listArea / .mailList / 메일 본문 영역의 parent 내부 input 우선
+            search_info = await self.page.evaluate("""() => {
+                // 후보 셀렉터들 (메일 컨텍스트 우선)
+                const candidates = [];
+                const selList = [
+                    '.listArea input[placeholder*="검색"]',
+                    '.mailList input[placeholder*="검색"]',
+                    '.inboxList input[placeholder*="검색"]',
+                    '.OBTSearcher input',
+                    'input[placeholder*="검색"]',
+                    'input[type="search"]',
+                ];
+                for (const sel of selList) {
+                    for (const el of document.querySelectorAll(sel)) {
+                        const r = el.getBoundingClientRect();
+                        if (r.width === 0 || r.height === 0) continue;
+                        candidates.push({
+                            sel: sel,
+                            x: Math.round(r.x + r.width/2),
+                            y: Math.round(r.y + r.height/2),
+                            placeholder: el.placeholder || '',
+                            cls: (el.className || '').substring(0, 60),
+                            parentCls: (el.parentElement?.className || '').substring(0, 60),
+                        });
+                    }
+                }
+                return candidates;
+            }""")
 
-            if not search_input:
-                return {"success": False, "error": "검색 입력창을 찾을 수 없습니다. (셀렉터 미발견)"}
+            if not search_info:
+                return {"success": False, "error": "검색 입력창을 찾을 수 없습니다.",
+                        "_diag_candidates": []}
 
-            # JS로 직접 입력 + Enter 키 이벤트 발송 (visibility 기준 미충족 우회)
-            await self.page.evaluate("""([el, keyword]) => {
-                el.scrollIntoView({block:'center'});
-                el.focus();
-                const setter = Object.getOwnPropertyDescriptor(
-                    window.HTMLInputElement.prototype, 'value').set;
-                setter.call(el, keyword);
-                el.dispatchEvent(new Event('input', {bubbles: true}));
-                el.dispatchEvent(new Event('change', {bubbles: true}));
-                el.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', keyCode:13, bubbles:true}));
-                el.dispatchEvent(new KeyboardEvent('keypress', {key:'Enter', keyCode:13, bubbles:true}));
-                el.dispatchEvent(new KeyboardEvent('keyup',   {key:'Enter', keyCode:13, bubbles:true}));
-            }""", [search_input, keyword])
-            # 검색 결과 로딩 대기 (셀렉터 기반, 최대 5초)
+            # 첫 번째 visible 후보 사용 (메일 컨텍스트 우선순으로 정렬되어 있음)
+            chosen = search_info[0]
+            search_sel = chosen["sel"]
+
+            # 실제 마우스 click + 타이핑
+            await self.page.mouse.click(chosen["x"], chosen["y"])
+            await self.page.wait_for_timeout(300)
+            await self.page.keyboard.press("Control+a")
+            await self.page.keyboard.press("Delete")
+            await self.page.keyboard.type(keyword, delay=30)
+            await self.page.wait_for_timeout(300)
+
+            # 검색 실행: Enter + 인접 돋보기 버튼 클릭 이중 시도
+            await self.page.keyboard.press("Enter")
+            await self.page.wait_for_timeout(400)
+
+            # 돋보기/검색 버튼 찾아 클릭 (Enter가 무시됐을 경우 대비)
+            search_btn_info = await self.page.evaluate(f"""() => {{
+                const inp = document.querySelector({repr(search_sel)});
+                if (!inp) return null;
+                // input의 부모/형제에서 search 관련 버튼 찾기
+                let scope = inp.parentElement;
+                for (let i = 0; i < 3 && scope; i++, scope = scope.parentElement) {{
+                    const btns = scope.querySelectorAll(
+                        'button, [role="button"], [class*="search" i] [class*="btn" i], ' +
+                        '[class*="Search" i], .ic_search, .icoSearch, i[class*="search" i]'
+                    );
+                    for (const btn of btns) {{
+                        const r = btn.getBoundingClientRect();
+                        if (r.width === 0 || r.height === 0) continue;
+                        const txt = (btn.innerText || btn.title || '').trim();
+                        const cls = (btn.className || '').toLowerCase();
+                        if (cls.includes('search') || txt === '검색' || txt === 'Search' ||
+                            btn.querySelector('[class*="search" i]')) {{
+                            return {{
+                                x: Math.round(r.x + r.width/2),
+                                y: Math.round(r.y + r.height/2),
+                                cls: btn.className.substring(0, 60),
+                                txt: txt.substring(0, 30),
+                            }};
+                        }}
+                    }}
+                }}
+                return null;
+            }}""")
+            if search_btn_info:
+                await self.page.mouse.click(search_btn_info["x"], search_btn_info["y"])
+                await self.page.wait_for_timeout(400)
+
+            # 검색 결과 로딩 대기
             try:
                 await self.page.wait_for_selector(".listItem, .emptyList, .noData", timeout=5000)
             except Exception:
                 await self.page.wait_for_timeout(1500)
+            await self.page.wait_for_timeout(800)
 
             rows = await self.page.query_selector_all(".listItem")
             mails = await self._parse_mail_rows(rows)
-            return {"success": True, "keyword": keyword, "folder": folder, "count": len(mails), "mails": mails}
+
+            # 입력값 검증
+            actual_val = await self.page.evaluate(
+                f"() => {{ const el = document.querySelector({repr(search_sel)}); return el ? el.value : null; }}"
+            )
+
+            return {
+                "success": True, "keyword": keyword, "folder": folder,
+                "count": len(mails), "mails": mails,
+                "_diag": {
+                    "chosen_selector": search_sel,
+                    "chosen_placeholder": chosen.get("placeholder", ""),
+                    "candidate_count": len(search_info),
+                    "search_input_value": actual_val,
+                    "search_button_clicked": search_btn_info,
+                },
+            }
         except Exception as e:
             return {"success": False, "error": str(e)}
 
@@ -2135,26 +2428,25 @@ class GroupwareClient:
             await self.page.wait_for_timeout(300)
 
             # ── 일시 섹션 펼치기 ──
-            # '일시' 텍스트를 포함한 scUnitTop을 찾아 클릭 (여러 scUnitChild 중 정확한 것 선택)
+            # 토글 트리거: scUnitTop 오른쪽 끝의 .icoArr (.down → .up, scUnitChild display:none → flex).
+            # scUnitTop 본체 클릭은 이벤트 핸들러가 없어서 동작하지 않음 — .icoArr 좌표로 클릭해야 함.
             def _js_expand_date_section():
                 return """() => {
-                    // '일시' 라벨이 있는 scUnitTop 우선
-                    for (const el of document.querySelectorAll('.scUnitTop')) {
-                        if ((el.innerText || '').includes('일시')) { el.click(); return 'datetime'; }
+                    const panel = document.querySelector('.pubScLayer.active, .pubLayerSlide.active');
+                    if (!panel) return false;
+                    for (const top of panel.querySelectorAll('.scUnitTop')) {
+                        if (!(top.innerText || '').startsWith('일시')) continue;
+                        const box = top.closest('.scUnitBox');
+                        const child = box && box.querySelector('.scUnitChild');
+                        // 이미 펼쳐졌으면 스킵
+                        if (child && getComputedStyle(child).display !== 'none') return 'already';
+                        const arr = top.querySelector('.icoArr');
+                        if (arr) {
+                            const r = arr.getBoundingClientRect();
+                            return {trigger: 'icoArr', x: Math.round(r.x + r.width/2),
+                                    y: Math.round(r.y + r.height/2)};
+                        }
                     }
-                    // 없으면 날짜 input이 속한 scUnitBox의 scUnitTop 클릭
-                    const dateInput = document.querySelector(
-                        '.scUnitChild .OBTDatePickerRebuild_inputYMD__PtxMy, ' +
-                        '.scUnitChild input[placeholder*="날짜"]'
-                    );
-                    if (dateInput) {
-                        const box = dateInput.closest('.scUnitBox');
-                        const top = box && box.querySelector('.scUnitTop');
-                        if (top) { top.click(); return 'by_input'; }
-                    }
-                    // 최후: 2번째 scUnitBox
-                    const el2 = document.querySelector('.scUnitBox:nth-child(2) .scUnitTop');
-                    if (el2) { el2.click(); return 'nth2'; }
                     return false;
                 }"""
 
@@ -2171,16 +2463,19 @@ class GroupwareClient:
                 return false;
             }""")
             if not date_visible:
-                await self.page.evaluate(_js_expand_date_section())
-                await self.page.wait_for_timeout(800)
-                # visible 될 때까지 최대 3초 추가 대기
+                expand_info = await self.page.evaluate(_js_expand_date_section())
+                logger.info(f"[create] 일시 섹션 펼침 정보: {expand_info}")
+                if isinstance(expand_info, dict) and expand_info.get("trigger") == "icoArr":
+                    await self.page.mouse.click(expand_info["x"], expand_info["y"])
+                await self.page.wait_for_timeout(900)
                 try:
                     await date_loc_primary.first.wait_for(state="visible", timeout=2000)
                 except Exception:
-                    # 재시도
                     logger.warning("일시 섹션 펼치기 재시도...")
-                    await self.page.evaluate(_js_expand_date_section())
-                    await self.page.wait_for_timeout(600)
+                    retry = await self.page.evaluate(_js_expand_date_section())
+                    if isinstance(retry, dict) and retry.get("trigger") == "icoArr":
+                        await self.page.mouse.click(retry["x"], retry["y"])
+                    await self.page.wait_for_timeout(700)
 
             # ── 종일 여부 ──
             if event_data.get("all_day"):
@@ -2241,76 +2536,29 @@ class GroupwareClient:
                     'input[placeholder*="날짜"], input[placeholder*="시작"], .scUnitChild input[type="text"]'
                 )
 
-            async def _fill_date(loc, val: str):
-                """OBT 날짜 입력 — loc.focus() 직접 사용 (mouse.click 버블 회피).
-                scUnitTop이 click을 가로채 섹션 collapse + 포커스 이전 문제를 피하기 위해
-                Playwright의 locator.focus()로 포커스만 확실히 잡고 타이핑."""
-                try:
-                    await loc.focus(timeout=5000)
-                except Exception as e:
-                    logger.warning(f"_fill_date focus 실패: {e}")
-                    # 폴백: JS focus()
-                    await loc.evaluate("el => el.focus()")
-                await self.page.wait_for_timeout(300)
-                # 포커스 확인 디버그
-                focused = await self.page.evaluate("""() => {
-                    const a = document.activeElement;
-                    return a ? {tag: a.tagName, cls: (a.className || '').substring(0, 50), val: a.value || ''} : null;
-                }""")
-                logger.info(f"[_fill_date] focus 확인: {focused}")
-                await self.page.keyboard.press("Control+a")
-                await self.page.keyboard.press("Delete")
-                await self.page.keyboard.type(val, delay=50)
-                await self.page.wait_for_timeout(300)
-                await self.page.keyboard.press("ArrowDown")
-                await self.page.wait_for_timeout(100)
-                await self.page.keyboard.press("Enter")
-                await self.page.wait_for_timeout(400)
-
+            # 날짜 입력: OBTDatePickerRebuild는 키보드 타이핑이 내부 상태로 커밋되지 않음.
+            # 사용자 수준 상호작용만 유효하므로 캘린더 아이콘 → 팝업 → 날짜 셀 클릭으로 선택.
             if date_count >= 2:
-                await _fill_date(date_locators.nth(0), start_val)
-                await _fill_date(date_locators.nth(1), end_val)
-                # 실제 DOM 값 검증: OBTDatePickerRebuild는 "YYYY-MM-DD" 포맷 보관 (대시 포함)
+                ok_s = await self._pick_date_from_popup(0, start_date)
+                if not ok_s:
+                    logger.warning(f"[create] start_date={start_date} 팝업 선택 실패 — 재시도")
+                    await self.page.wait_for_timeout(500)
+                    ok_s = await self._pick_date_from_popup(0, start_date)
+                ok_e = await self._pick_date_from_popup(1, end_date)
+                if not ok_e:
+                    logger.warning(f"[create] end_date={end_date} 팝업 선택 실패 — 재시도")
+                    await self.page.wait_for_timeout(500)
+                    ok_e = await self._pick_date_from_popup(1, end_date)
+                # 값 확인 로그 (하드-페일 검증은 아래 form_state 블록에서 수행)
                 actual_dates = await self.page.evaluate("""() => {
                     const panel = document.querySelector('.pubScLayer.active, .pubLayerSlide.active');
                     if (!panel) return [];
                     const inputs = [...panel.querySelectorAll('.OBTDatePickerRebuild_inputYMD__PtxMy')];
                     return inputs.map(i => i.value);
                 }""")
-                logger.info(f"[create] 날짜 타이핑 후 값: {actual_dates}")
-                if len(actual_dates) >= 2 and (actual_dates[0] != start_date or actual_dates[1] != end_date):
-                    logger.warning(
-                        f"날짜 입력 불일치(기대={start_date}/{end_date}, 실제={actual_dates[:2]}) "
-                        f"— 재타이핑 재시도 (OBTDatePicker는 OBTComplete2 버퍼 → Enter 커밋 필요)"
-                    )
-                    # 재시도: 섹션 재전개 + 다시 mouse.click + type + Enter
-                    await self.page.evaluate(_js_expand_date_section())
-                    await self.page.wait_for_timeout(500)
-                    try:
-                        await _fill_date(date_locators.nth(0), start_val)
-                        await _fill_date(date_locators.nth(1), end_val)
-                    except Exception as e:
-                        logger.warning(f"재시도 _fill_date 실패: {e}")
+                logger.info(f"[create] 팝업 선택 후 DatePicker 값: {actual_dates}")
             else:
-                logger.warning(f"날짜 visible 필드 미발견 (count={date_count}) — JS native setter 사용")
-                await self.page.evaluate(f"""() => {{
-                    const inputs = [...document.querySelectorAll(
-                        '.scUnitChild .OBTDatePickerRebuild_inputYMD__PtxMy, ' +
-                        '.scUnitChild input[type="text"], .scUnitChild input:not([type])'
-                    )];
-                    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-                    if (inputs[0]) {{
-                        setter.call(inputs[0], '{start_val}');
-                        inputs[0].dispatchEvent(new Event('input', {{bubbles: true}}));
-                        inputs[0].dispatchEvent(new Event('change', {{bubbles: true}}));
-                    }}
-                    if (inputs[1]) {{
-                        setter.call(inputs[1], '{end_val}');
-                        inputs[1].dispatchEvent(new Event('input', {{bubbles: true}}));
-                        inputs[1].dispatchEvent(new Event('change', {{bubbles: true}}));
-                    }}
-                }}""")
-                await self.page.wait_for_timeout(500)
+                logger.warning(f"날짜 visible 필드 미발견 (count={date_count}) — 팝업 선택 시도 없이 진행")
 
             # ── 시간 입력 (OBTComplete2 드롭다운 클릭) ──
             time_warnings = []
@@ -2584,6 +2832,22 @@ class GroupwareClient:
         except ValueError:
             return {"success": False, "error": f"event_id 인덱스 오류: '{parts[1]}' (정수 필요)"}
 
+        # 이전 호출(update 등) 후 잔류 패널·모달 선정리 + 일정 페이지 강제 재로드
+        # 잔류 상태에서 행 클릭이 엉뚱한 요소에 떨어져 "일정 등록" 폼이 열리는 문제 방지
+        await self._close_all_popups()
+        self._sched_calendar = None
+        self._sched_view = None
+        self._sched_month = None
+        try:
+            # 일정 페이지면 reload로 깨끗한 상태, 아니면 navigate가 goto 수행
+            if "moduleCode=UE" in self.page.url and "menuCode=UEA" in self.page.url:
+                await self.page.reload(wait_until="domcontentloaded", timeout=15000)
+                try:
+                    await self.page.wait_for_selector(".fc-view, .fc-daygrid", timeout=8000)
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.warning(f"_click_schedule_row reload 실패(무시): {e}")
         await self._navigate_to_schedule()
         if calendar_name:
             await self._select_sidebar_calendar(calendar_name)
